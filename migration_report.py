@@ -3,7 +3,7 @@ from pyxnat import Interface
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 import time
-import pdb
+import pandas as pd
 
 # ----------- CONFIGURATION -----------
 # This script uses pyxnat. pyxnat uses configuration files
@@ -13,10 +13,11 @@ import pdb
 # See pyxnat documentation for more information.
 XNAT1_CFG = os.path.expanduser('~/xnat.cfg')
 XNAT2_CFG = os.path.expanduser('~/xnat2.cfg')
+MAX_WORKERS=16
 # -------------------------------------
 
 # --- Worker Function to get file stats for a single experiment ---
-def get_experiment_file_stats(xnat_interface_config_path, experiment_id, project_id, subject_id, subject_label):
+def get_experiment_file_stats(xnat_interface_config_path, xnat2_config, experiment_id, project_id, subject_id, subject_label):
     """
     Connects to XNAT, fetches file statistics (count and total size) for a single experiment
     by iterating through its scans and their resources.
@@ -33,8 +34,7 @@ def get_experiment_file_stats(xnat_interface_config_path, experiment_id, project
         # API call: /data/experiments/{experiment_id}/scans
         response = thread_xnat_interface.get(f'/data/experiments/{experiment_id}/scans')
         assert response.ok, f"Failed to get scans for experiment {experiment_id}"
-        pdb.set_trace()
-        scans_list = response.json()['ResultsSet']['Result']
+        scans_list = response.json()['ResultSet']['Result']
 
         # Step 2: For each scan, get its resources and aggregate file stats
         for scan in scans_list:
@@ -44,17 +44,30 @@ def get_experiment_file_stats(xnat_interface_config_path, experiment_id, project
             URI = scan['URI']
             resources_resp = thread_xnat_interface.get(f'{URI}/resources')
             assert resources_resp.ok, f"Failed to get resources for scan {scan['ID']} in experiment {experiment_id}"    
-            resources_list = resources_resp.json()['ResultsSet']['Result']
+            resources_list = resources_resp.json()['ResultSet']['Result']
 
             # Sum 'file_size' and 'file_count' from the resources of this scan
             # Handle potential NaN values if some resources don't have these fields
-            total_experiment_files += sum(res.get('file_count', 0) for res in resources_list)
-            total_experiment_size_bytes += sum(res.get('file_size', 0) for res in resources_list)
+            total_experiment_files += sum((int(res.get('file_count', 0)) for res in resources_list))
+            total_experiment_size_bytes += sum((int(res.get('file_size', 0)) for res in resources_list))
+
+        # step 3: create a mapping of experiment IDs --> experiment Labels
+        resp = thread_xnat_interface.get('/data/experiments?columns=ID,label')
+        list_of_dicts = resp.json()['ResultSet']['Result']
+        id_to_label_map = {d["ID"]: d["label"] for d in list_of_dicts}
+        experiment_label = id_to_label_map.get(experiment_id, 'Label Not Found')
+
+        # step 4: Does this experiment exist in XNAT2?
+        xnat2_interface = Interface(config=xnat2_config)
+        xnat2_exists = xnat2_interface.select.experiment(experiment_label).exists()
 
         return {
             'project_id': project_id,
             'subject_id': subject_id,
+            'subject_label': subject_label,
             'experiment_id': experiment_id,
+            'experiment_label': experiment_label,
+            'xnat2_exists': xnat2_exists,
             'num_files': int(total_experiment_files), # Ensure integer
             'total_size_bytes': int(total_experiment_size_bytes) # Ensure integer
         }
@@ -63,7 +76,9 @@ def get_experiment_file_stats(xnat_interface_config_path, experiment_id, project
         return {
             'project_id': project_id,
             'subject_id': subject_id,
+            'suject_label': subject_label,
             'experiment_id': experiment_id,
+            'experiment_label': experiment_label,
             'num_files': None,
             'total_size_bytes': None,
             'error': str(e)
@@ -73,7 +88,12 @@ def get_experiment_file_stats(xnat_interface_config_path, experiment_id, project
             try:
                 thread_xnat_interface.disconnect()
             except Exception as e:
-                print(f"Error disconnecting XNAT interface for experiment {experiment_id}: {e}", flush=True)
+                print(f"Error disconnecting XNAT1 interface for experiment {experiment_id}: {e}", flush=True)
+        if xnat2_interface:
+            try:
+                xnat2_interface.disconnect()
+            except Exception as e:
+                print(f"Error disconnecting XNAT2 interface for experiment {experiment_id}: {e}", flush=True)
 
 def get_session_info(exp):
     """Returns session info: [(session_label, project, investigator)]"""
@@ -96,14 +116,15 @@ def session_exists(xnat_interface, session_label):
 
 def main():
 
-    # generate the migration report
+    start_time = time.time()
 
     xnat1 = Interface(config=XNAT1_CFG)
-    xnat2 = Interface(config=XNAT2_CFG)
 
     # select all of the MRI scan sessions (in xnat terminology, the "experiments") currently on xnat1
-    search_object = xnat1.select('xnat:mrSessionData', ['xnat:mrSessionData/PROJECT','xnat:mrSessionData/SUBJECT_ID', 'xnat:mrSessionData/SESSION_ID'])
+    search_object = xnat1.select('xnat:mrSessionData', ['xnat:mrSessionData/PROJECT','xnat:mrSessionData/SUBJECT_ID', 'xnat:mrSessionData/SESSION_ID', 'xnat:mrSessionData/SUBJECT_LABEL'])
     experiments_table = search_object.all()
+
+    xnat1.disconnect()
 
     experiment_tasks = []
     for row in experiments_table:
@@ -120,16 +141,16 @@ def main():
     processed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit tasks and map experiment_tasks to get_experiment_file_stats
-        futures = {executor.submit(get_experiment_file_stats, XNAT2_CFG, experiment_id, project_id, subject_id, subject_label): (experiment_id, project_id, subject_id, subject_label)
+        futures = {executor.submit(get_experiment_file_stats, XNAT1_CFG, XNAT2_CFG, experiment_id, project_id, subject_id, subject_label): (experiment_id, project_id, subject_id, subject_label)
                    for experiment_id, project_id, subject_id, subject_label in experiment_tasks}
         
         for future in as_completed(futures):
             processed_count += 1
-            exp_id_current, _, _ = futures[future] # Get experiment ID for logging progress
+            exp_id_current, _, _, _ = futures[future] # Get experiment ID for logging progress
             try:
                 result = future.result()
                 results.append(result)
-                if processed_count % 10 == 0: # Print progress more frequently
+                if processed_count % 10 == 0 or processed_count == len(experiment_tasks): # Print every 5 tasks, and always print the final one
                     print(f"Processed {processed_count}/{len(experiment_tasks)} experiments. Current: {exp_id_current}", flush=True)
             except Exception as e:
                 print(f"A task for experiment {exp_id_current} failed to complete: {e}", flush=True)
@@ -156,54 +177,6 @@ def main():
         print(f"Detailed results saved to {output_filename}")
     else:
         print("No successful results to display or save.")
-
-
-
-
-
-
-
-    experiments = xnat1.select.projects().subjects().experiments()
-    
-    output_csv_filename = os.path.expanduser('~/xnat_migration_report.csv')
-    fieldnames = ['project_label', 'pi_firstname', 'pi_lastname', 'subject_label', 'experiment_label', 'file_count', 'file_size', 'exists_on_xnat2']
-
-    # for each experiment found...
-    c = 0
-    for exp in experiments:
-
-        # check if this session is already in the report (skip if so)
-
-        # extract key information about that session
-        project_label, pi_firstname, pi_lastname, subject_label, experiment_label, file_count, file_size = get_session_info(exp)
-
-        c += 1
-        print(f"Processing session {c}/4030: {experiment_label}...")
-
-        # does this session exist on xnat2?
-        exists_on_xnat2 = session_exists(xnat2, experiment_label)
-    
-        # append to the report
-        report_data.append({
-            'project_label': project_label,
-            'pi_firstname': pi_firstname,
-            'pi_lastname': pi_lastname,
-            'subject_label': subject_label,
-            'experiment_label': experiment_label,
-            'file_count': file_count,
-            'file_size': file_size,
-            'exists_on_xnat2': exists_on_xnat2
-        })
-
-    # write the report to a CSV file
-    df_report = pd.DataFrame(report_data)
-
-    # Define the output CSV file name
-    output_csv_filename = os.path.expanduser('~/xnat_migration_report.csv')
-
-    # Write the DataFrame to a CSV file
-    # index=False prevents pandas from writing the DataFrame index as a column in the CSV
-    df_report.to_csv(output_csv_filename, index=False)
 
 if __name__ == '__main__':
     main()

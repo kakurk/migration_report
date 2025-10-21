@@ -8,10 +8,11 @@ def test_get_experiment_file_stats():
     
     # opens up a connection to xnat2.bu.edu. Assumes user has a proper configuration
     # file in their home directory.
+    xnat_cfg = os.path.expanduser('~/xnat.cfg')
     xnat2_cfg = os.path.expanduser('~/xnat2.cfg')
     
     start_time = time.time()
-    stats = get_experiment_file_stats(xnat2_cfg, 'BU_CNC_E00010', 'qa', 'BU_CNC_S00008', '240715_QA')
+    stats = get_experiment_file_stats(xnat_cfg, xnat2_cfg, 'CNC_Archive_E02462', 'BASS', 'CNC_Archive_S02250', '230814_BASSptp024')
     end_time = time.time()
 
     elapsed_time = end_time - start_time
