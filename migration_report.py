@@ -95,25 +95,6 @@ def get_experiment_file_stats(xnat_interface_config_path, xnat2_config, experime
             except Exception as e:
                 print(f"Error disconnecting XNAT2 interface for experiment {experiment_id}: {e}", flush=True)
 
-def get_session_info(exp):
-    """Returns session info: [(session_label, project, investigator)]"""
-    project_label = exp.parent().parent().label()
-    subject_label = exp.parent().label()
-    pi_lastname = exp.parent().parent().attrs.get('pi_lastname')
-    pi_firstname = exp.parent().parent().attrs.get('pi_firstname')
-    experiment_label = exp.label()
-    resources = exp.scans().resources()
-    file_size = 0
-    file_count = 0
-    for res in resources:
-        res_attributes = res.attributes()
-        file_size += int(res_attributes['file_size'])
-        file_count += int(res_attributes['file_count'])
-    return project_label, pi_firstname, pi_lastname, subject_label, experiment_label, file_count, file_size
-
-def session_exists(xnat_interface, session_label):
-    return xnat_interface.select.experiment(session_label).exists()
-
 def main():
 
     start_time = time.time()
